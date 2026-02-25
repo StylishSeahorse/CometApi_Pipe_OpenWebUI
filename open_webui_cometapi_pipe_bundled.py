@@ -17360,6 +17360,11 @@ class Filter:
         allowlist_norm_ids: set[str],
         catalog_norm_ids: set[str],
     ) -> list[str]:
+        model_norm_id = (model_norm_id or "").strip()
+        if model_norm_id.startswith("open_webui_") and "." in model_norm_id:
+            model_norm_id = model_norm_id.split(".", 1)[1].strip()
+        model_norm_id = ModelFamily.base_model(model_norm_id) or model_norm_id
+
         reasons: list[str] = []
         if catalog_norm_ids and model_norm_id not in catalog_norm_ids:
             reasons.append("not_in_catalog")
@@ -18782,10 +18787,31 @@ class RequestOrchestrator:
             transformer_valves=valves,
 
         )
+        requested_model_raw = responses_body.model
         dequalified_model = self._pipe._strip_pipe_prefix_from_model(
             pipe_identifier,
-            responses_body.model,
+            requested_model_raw,
         )
+        if not dequalified_model and isinstance(requested_model_raw, str):
+            dequalified_model = requested_model_raw.strip() or None
+
+        # Fallback for loader wrappers where the runtime prefix differs from self.id,
+        # e.g. open_webui_cometapi_loader.claude-sonnet-4-6.
+        if isinstance(dequalified_model, str):
+            model_trimmed = dequalified_model.strip()
+
+            # If metadata carries a qualified model id and it matches the request,
+            # strip exactly the first prefix segment from metadata.
+            meta_model = (openwebui_model_id or "").strip()
+            if meta_model and model_trimmed == meta_model and "." in meta_model:
+                model_trimmed = meta_model.split(".", 1)[1].strip() or model_trimmed
+
+            # Generic Open WebUI-prefixed fallback for custom loader ids.
+            if model_trimmed.startswith("open_webui_") and "." in model_trimmed:
+                model_trimmed = model_trimmed.split(".", 1)[1].strip() or model_trimmed
+
+            dequalified_model = model_trimmed
+
         if dequalified_model:
             responses_body.model = dequalified_model
         self._pipe._sanitize_request_input(responses_body)

@@ -91,7 +91,13 @@ def _load_cached_module() -> Optional[str]:
 
 def _get_bundled_module_path() -> str:
     """Get the path to the bundled module, downloading from GitHub if needed."""
-    # Try to use cached version first
+    # Prefer local file first so local fixes are used immediately.
+    local_path = Path(__file__).parent / BUNDLED_FILENAME
+    if local_path.exists():
+        logger.info(f"📄 Using local bundled module from {local_path}")
+        return str(local_path)
+
+    # Then try cached version.
     cached_path = _load_cached_module()
     if cached_path:
         return cached_path
@@ -101,12 +107,6 @@ def _get_bundled_module_path() -> str:
     github_path = _download_from_github()
     if github_path:
         return github_path
-    
-    # Fallback: check if file exists in current directory
-    local_path = Path(__file__).parent / BUNDLED_FILENAME
-    if local_path.exists():
-        logger.info(f"⚠️ Using local copy from {local_path}")
-        return str(local_path)
     
     # Error: can't find the module anywhere
     raise FileNotFoundError(
