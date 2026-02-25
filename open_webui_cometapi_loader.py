@@ -37,6 +37,8 @@ BUNDLED_FILENAME = "open_webui_cometapi_pipe_bundled.py"
 CACHE_DIR = Path.home() / ".cache" / "open-webui-cometapi"
 CACHE_FILE = CACHE_DIR / BUNDLED_FILENAME
 METADATA_FILE = CACHE_DIR / ".metadata.json"
+PREFER_GITHUB = (os.getenv("COMETAPI_PIPE_PREFER_GITHUB", "1") or "1").strip() in {"1", "true", "yes", "on"}
+FORCE_GITHUB_REFRESH = (os.getenv("COMETAPI_PIPE_FORCE_GITHUB", "0") or "0").strip() in {"1", "true", "yes", "on"}
 
 # URLs
 GITHUB_DOWNLOAD_URL = f"{GITHUB_RAW_BASE}/{BUNDLED_FILENAME}"
@@ -91,6 +93,17 @@ def _load_cached_module() -> Optional[str]:
 
 def _get_bundled_module_path() -> str:
     """Get the path to the bundled module, downloading from GitHub if needed."""
+    if FORCE_GITHUB_REFRESH:
+        logger.info("🔄 COMETAPI_PIPE_FORCE_GITHUB enabled; forcing fresh GitHub download")
+        github_path = _download_from_github()
+        if github_path:
+            return github_path
+
+    if PREFER_GITHUB:
+        github_path = _download_from_github()
+        if github_path:
+            return github_path
+
     # Prefer local file first so local fixes are used immediately.
     local_path = Path(__file__).parent / BUNDLED_FILENAME
     if local_path.exists():

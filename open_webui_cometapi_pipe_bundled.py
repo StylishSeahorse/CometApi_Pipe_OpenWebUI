@@ -1,12 +1,12 @@
 """
 title: Open WebUI CometAPI Responses Pipe
-author: rbb-dev
-author_url: https://github.com/rbb-dev
-git_url: https://github.com/rbb-dev/Open-WebUI-CometAPI-pipe
+author: Stylishseahorse
+author_url: https://github.com/Stylishseahorse/
+git_url: https://github.com/Stylishseahorse/Open-WebUI-CometAPI-pipe
 id: open_webui_cometapi_pipe
 description: CometAPI Responses API integration for Open WebUI (bundled monolith)
 required_open_webui_version: 0.7.0
-version: 2.0.6
+version: 1.0.8
 requirements: aiohttp, cryptography, fastapi, httpx, lz4, pydantic, pydantic_core, sqlalchemy, tenacity, pyzipper, cairosvg, Pillow
 license: MIT
 """
@@ -112,7 +112,7 @@ try:
     from importlib.metadata import version as _get_version
     __version__ = _get_version("open-webui-cometapi-pipe")
 except Exception:
-    __version__ = "2.0.6"  # Fallback if not installed as package
+    __version__ = "1.0.8"  # Fallback if not installed as package
 
 # -----------------------------------------------------------------------------
 # Type hints only (no runtime import)
@@ -1875,345 +1875,17 @@ class ResponsesAdapter:
         event_queue_maxsize: int = 100,
         event_queue_warn_size: int = 1000,
     ) -> AsyncGenerator[dict[str, Any], None]:
-        """Producer/worker SSE pipeline with configurable delta batching."""
+        """CometAPI shim: delegate legacy Responses streaming to chat-completions adapter."""
 
-        effective_valves = valves or self._pipe.valves
-        chunk_size = getattr(effective_valves, "IMAGE_UPLOAD_CHUNK_BYTES", self._pipe.valves.IMAGE_UPLOAD_CHUNK_BYTES)
-        max_bytes = int(getattr(effective_valves, "BASE64_MAX_SIZE_MB", self._pipe.valves.BASE64_MAX_SIZE_MB)) * 1024 * 1024
-        await self._pipe._inline_internal_responses_input_files_inplace(
+        async for event in self._pipe._ensure_chat_completions_adapter().send_openai_chat_completions_streaming_request(
+            session,
             request_body,
-            chunk_size=chunk_size,
-            max_bytes=max_bytes,
-        )
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-        }
-        self._pipe._maybe_apply_anthropic_beta_headers(
-            headers,
-            request_body.get("model"),
-            valves=effective_valves,
-        )
-        _debug_print_request(headers, request_body, logger=self.logger)
-        url = base_url.rstrip("/") + "/responses"
-
-        workers = max(1, min(int(workers or 1), 8))
-        chunk_queue_size = max(0, int(chunk_queue_maxsize))
-        event_queue_size = max(0, int(event_queue_maxsize))
-        chunk_queue: asyncio.Queue[tuple[Optional[int], bytes]] = asyncio.Queue(maxsize=chunk_queue_size)
-        event_queue: asyncio.Queue[tuple[Optional[int], Optional[dict[str, Any]]]] = asyncio.Queue(maxsize=event_queue_size)
-        chunk_sentinel = (None, b"")
-        delta_batch_threshold = max(1, int(delta_char_limit))
-        idle_flush_seconds = float(idle_flush_ms) / 1000 if idle_flush_ms > 0 else None
-        passthrough_deltas = delta_char_limit <= 0 and idle_flush_ms <= 0
-        requested_model = request_body.get("model")
-
-        @timed
-        async def _producer() -> None:
-            seq = 0
-            first_chunk_received = False
-            retryer = AsyncRetrying(
-                stop=stop_after_attempt(3),
-                wait=wait_exponential(multiplier=0.5, min=0.5, max=4),
-                retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError)),
-                reraise=True,
-            )
-            try:
-                async for attempt in retryer:
-                    if breaker_key and not self._pipe._breaker_allows(breaker_key):
-                        raise RuntimeError("Breaker open for user during stream")
-                    with attempt:
-                        buf = bytearray()
-                        event_data_parts: list[bytes] = []
-                        stream_complete = False
-                        try:
-                            timing_mark("responses_http_request_start")
-                            async with session.post(url, json=request_body, headers=headers) as resp:
-                                timing_mark("responses_http_headers_received")
-                                if resp.status >= 400:
-                                    error_body = await _debug_print_error_response(resp, logger=self.logger)
-                                    if breaker_key:
-                                        self._pipe._record_failure(breaker_key)
-                                    special_statuses = {400, 401, 402, 403, 404, 408, 429}
-                                    if resp.status in special_statuses:
-                                        extra_meta: dict[str, Any] = {}
-                                        retry_after = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
-                                        if retry_after:
-                                            extra_meta["retry_after"] = retry_after
-                                            extra_meta["retry_after_seconds"] = retry_after
-                                        rate_scope = (
-                                            resp.headers.get("X-RateLimit-Scope")
-                                            or resp.headers.get("x-ratelimit-scope")
-                                        )
-                                        if rate_scope:
-                                            extra_meta["rate_limit_type"] = rate_scope
-                                        reason_text = resp.reason or "HTTP error"
-                                        raise _build_cometapi_api_error(
-                                            resp.status,
-                                            reason_text,
-                                            error_body,
-                                            requested_model=request_body.get("model"),
-                                            extra_metadata=extra_meta or None,
-                                        )
-                                    if resp.status < 500:
-                                        raise RuntimeError(
-                                            f"CometAPI request failed ({resp.status}): {resp.reason}"
-                                        )
-                                resp.raise_for_status()
-
-                                chunk_count = 0
-                                first_event_queued = False
-                                async for chunk in resp.content.iter_chunked(4096):
-                                    chunk_count += 1
-                                    # Log chunk with content preview (first 40 chars, sanitized)
-                                    preview = chunk[:40].decode("utf-8", errors="replace").replace("\n", "\\n").replace("\r", "\\r")
-                                    timing_mark(f"chunk_{chunk_count}_len_{len(chunk)}_[{preview}]")
-                                    if not first_chunk_received:
-                                        first_chunk_received = True
-                                        timing_mark("responses_first_chunk")
-                                    view = memoryview(chunk)
-                                    if breaker_key and not self._pipe._breaker_allows(breaker_key):
-                                        raise RuntimeError("Breaker open during stream")
-                                    buf.extend(view)
-                                    start_idx = 0
-                                    while True:
-                                        newline_idx = buf.find(b"\n", start_idx)
-                                        if newline_idx == -1:
-                                            break
-                                        line = buf[start_idx:newline_idx]
-                                        start_idx = newline_idx + 1
-                                        stripped = line.strip()
-                                        if not stripped:
-                                            if event_data_parts:
-                                                data_blob = b"\n".join(event_data_parts).strip()
-                                                event_data_parts.clear()
-                                                if not data_blob:
-                                                    continue
-                                                if data_blob == b"[DONE]":
-                                                    stream_complete = True
-                                                    timing_mark("responses_stream_done")
-                                                    break
-                                                if not first_event_queued:
-                                                    first_event_queued = True
-                                                    timing_mark("producer_first_event_queued")
-                                                await chunk_queue.put((seq, data_blob))
-                                                seq += 1
-                                            continue
-                                        if stripped.startswith(b":"):
-                                            continue
-                                        if stripped.startswith(b"data:"):
-                                            event_data_parts.append(bytes(stripped[5:].lstrip()))
-                                            continue
-                                    if start_idx > 0:
-                                        del buf[:start_idx]
-                                    if stream_complete:
-                                        break
-
-                                if event_data_parts and not stream_complete:
-                                    data_blob = b"\n".join(event_data_parts).strip()
-                                    event_data_parts.clear()
-                                    if data_blob and data_blob != b"[DONE]":
-                                        await chunk_queue.put((seq, data_blob))
-                                        seq += 1
-                        except Exception as producer_exc:
-                            is_auth_failure = (
-                                isinstance(producer_exc, CometAPIAPIError)
-                                and getattr(producer_exc, "status", None) in {401, 403}
-                            )
-                            if is_auth_failure:
-                                self._pipe._note_auth_failure()
-                                self.logger.warning(
-                                    "Producer encountered auth error while streaming from CometAPI: %s",
-                                    producer_exc,
-                                )
-                            else:
-                                self.logger.error(
-                                    "Producer encountered error while streaming from CometAPI: %s",
-                                    producer_exc,
-                                    exc_info=True,
-                                )
-                            if breaker_key:
-                                self._pipe._record_failure(breaker_key)
-                            raise
-                        if stream_complete:
-                            break
-            finally:
-                for _ in range(workers):
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await chunk_queue.put(chunk_sentinel)
-
-        worker_first_event_queued = False
-
-        @timed
-        async def _worker(worker_idx: int) -> None:
-            nonlocal worker_first_event_queued
-            first_chunk_got = False
-            try:
-                while True:
-                    seq, data = await chunk_queue.get()
-                    if not first_chunk_got:
-                        first_chunk_got = True
-                        timing_mark(f"worker_{worker_idx}_first_chunk_got")
-                    try:
-                        if seq is None:
-                            break
-                        if data == b"[DONE]":
-                            continue
-                        try:
-                            event = json.loads(data.decode("utf-8"))
-                        except json.JSONDecodeError as exc:
-                            self.logger.warning("Chunk parse failed (seq=%s): %s", seq, exc)
-                            continue
-                        if not worker_first_event_queued:
-                            worker_first_event_queued = True
-                            timing_mark("worker_first_event_to_queue")
-                        await event_queue.put((seq, event))
-                    finally:
-                        chunk_queue.task_done()
-            finally:
-                with contextlib.suppress(asyncio.CancelledError):
-                    await event_queue.put((None, None))
-
-        producer_task = asyncio.create_task(_producer(), name="cometapi-sse-producer")
-        worker_tasks = [
-            asyncio.create_task(_worker(idx), name=f"cometapi-sse-worker-{idx}")
-            for idx in range(workers)
-        ]
-
-        pending_events: dict[int, dict[str, Any]] = {}
-        next_seq = 0
-        done_workers = 0
-        delta_buffer: list[str] = []
-        delta_template: Optional[dict[str, Any]] = None
-        delta_length = 0
-        event_queue_warn_last_ts: float = 0.0
-
-        @timed
-        def flush_delta(force: bool = False) -> Optional[dict[str, Any]]:
-            if passthrough_deltas:
-                return None
-            nonlocal delta_buffer, delta_template, delta_length
-            if delta_buffer and (force or delta_length >= delta_batch_threshold):
-                combined = "".join(delta_buffer)
-                base = dict(delta_template or {"type": "response.output_text.delta"})
-                base["delta"] = combined
-                delta_buffer = []
-                delta_template = None
-                delta_length = 0
-                return base
-            return None
-
-        first_event_from_queue = False
-        first_yield_done = False
-
-        try:
-            while True:
-                timeout = idle_flush_seconds if (idle_flush_seconds and delta_buffer) else None
-                timed_out = False
-                seq: int | None = None
-                event: dict[str, Any] | None = None
-                if timeout is not None:
-                    try:
-                        seq, event = await asyncio.wait_for(event_queue.get(), timeout=timeout)
-                    except asyncio.TimeoutError:
-                        timed_out = True
-                else:
-                    seq, event = await event_queue.get()
-                if not first_event_from_queue and seq is not None:
-                    first_event_from_queue = True
-                    timing_mark("consumer_first_event_from_queue")
-
-                if timed_out:
-                    batched = flush_delta(force=True)
-                    if batched:
-                        yield batched
-                    continue
-
-                event_queue.task_done()
-
-                # Non-spammy queue monitoring
-                now = time.perf_counter()
-                if self._pipe._should_warn_event_queue_backlog(
-                    event_queue.qsize(),
-                    event_queue_warn_size,
-                    now,
-                    event_queue_warn_last_ts,
-                ):
-                    self.logger.warning(
-                        "Event queue backlog high: %d items (session=%s)",
-                        event_queue.qsize(),
-                        SessionLogger.session_id.get() or "unknown",
-                    )
-                    event_queue_warn_last_ts = now
-
-                if seq is None:
-                    done_workers += 1
-                    if done_workers >= workers and not pending_events:
-                        break
-                    continue
-                if event is None:
-                    self.logger.debug("Skipping empty SSE event (seq=%s)", seq)
-                    continue
-                pending_events[seq] = event
-                while next_seq in pending_events:
-                    current = pending_events.pop(next_seq)
-                    next_seq += 1
-                    streaming_error = self._pipe._extract_streaming_error_event(current, requested_model)
-                    if streaming_error is not None:
-                        raise streaming_error
-                    etype = current.get("type")
-                    if etype == "response.output_text.delta":
-                        delta_chunk = current.get("delta", "")
-                        if passthrough_deltas:
-                            if delta_chunk:
-                                if not first_yield_done:
-                                    first_yield_done = True
-                                    timing_mark("adapter_first_yield")
-                                yield current
-                            continue
-                        if delta_chunk:
-                            delta_buffer.append(delta_chunk)
-                            delta_length += len(delta_chunk)
-                            if delta_template is None:
-                                delta_template = {k: v for k, v in current.items() if k != "delta"}
-                        batched = flush_delta()
-                        if batched:
-                            yield batched
-                        continue
-
-                    batched = flush_delta(force=True)
-                    if batched:
-                        if not first_yield_done:
-                            first_yield_done = True
-                            timing_mark("adapter_first_yield")
-                        yield batched
-                    if not first_yield_done:
-                        first_yield_done = True
-                        timing_mark("adapter_first_yield")
-                    yield current
-
-            final_delta = flush_delta(force=True)
-            if final_delta:
-                yield final_delta
-
-            await producer_task
-        finally:
-            if not producer_task.done():
-                producer_task.cancel()
-            for task in worker_tasks:
-                if not task.done():
-                    task.cancel()
-            results = await asyncio.gather(producer_task, *worker_tasks, return_exceptions=True)
-            for idx, result in enumerate(results):
-                if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
-                    task_name = "producer" if idx == 0 else f"worker-{idx - 1}"
-                    self.logger.error(
-                        "SSE %s task failed during cleanup: %s",
-                        task_name,
-                        result,
-                        exc_info=result,
-                    )
+            api_key,
+            base_url,
+            valves=valves,
+            breaker_key=breaker_key,
+        ):
+            yield event
 
 
     # ======================================================================
@@ -2231,70 +1903,16 @@ class ResponsesAdapter:
         valves: Pipe.Valves | None = None,
         breaker_key: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Send a blocking request to the Responses API and return the JSON payload."""
-        effective_valves = valves or self._pipe.valves
-        chunk_size = getattr(effective_valves, "IMAGE_UPLOAD_CHUNK_BYTES", self._pipe.valves.IMAGE_UPLOAD_CHUNK_BYTES)
-        max_bytes = int(getattr(effective_valves, "BASE64_MAX_SIZE_MB", self._pipe.valves.BASE64_MAX_SIZE_MB)) * 1024 * 1024
-        await self._pipe._inline_internal_responses_input_files_inplace(
+        """CometAPI shim: delegate legacy Responses non-streaming to chat-completions adapter."""
+
+        return await self._pipe._ensure_chat_completions_adapter().send_openai_chat_completions_nonstreaming_request(
+            session,
             request_params,
-            chunk_size=chunk_size,
-            max_bytes=max_bytes,
+            api_key,
+            base_url,
+            valves=valves,
+            breaker_key=breaker_key,
         )
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-        _debug_print_request(headers, request_params, logger=self.logger)
-        url = base_url.rstrip("/") + "/responses"
-
-        retryer = AsyncRetrying(
-            stop=stop_after_attempt(3),
-            wait=wait_exponential(multiplier=0.5, min=0.5, max=4),
-            retry=retry_if_exception_type((aiohttp.ClientError, asyncio.TimeoutError)),
-            reraise=True,
-        )
-
-        async for attempt in retryer:
-            with attempt:
-                if breaker_key and not self._pipe._breaker_allows(breaker_key):
-                    raise RuntimeError("Breaker open for user during request")
-
-                async with session.post(url, json=request_params, headers=headers) as resp:
-                    if resp.status >= 400:
-                        error_body = await _debug_print_error_response(resp, logger=self.logger)
-                        if breaker_key:
-                            self._pipe._record_failure(breaker_key)
-                        if resp.status < 500:
-                            special_statuses = {400, 401, 402, 403, 404, 408, 429}
-                            if resp.status in special_statuses:
-                                extra_meta: dict[str, Any] = {}
-                                retry_after = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
-                                if retry_after:
-                                    extra_meta["retry_after"] = retry_after
-                                    extra_meta["retry_after_seconds"] = retry_after
-                                rate_scope = (
-                                    resp.headers.get("X-RateLimit-Scope")
-                                    or resp.headers.get("x-ratelimit-scope")
-                                )
-                                if rate_scope:
-                                    extra_meta["rate_limit_type"] = rate_scope
-                                reason_text = resp.reason or "HTTP error"
-                                raise _build_cometapi_api_error(
-                                    resp.status,
-                                    reason_text,
-                                    error_body,
-                                    requested_model=request_params.get("model"),
-                                    extra_metadata=extra_meta or None,
-                                )
-                            raise RuntimeError(
-                                f"CometAPI request failed ({resp.status}): {resp.reason}"
-                            )
-                    resp.raise_for_status()
-                    payload = await resp.json()
-                    _debug_print_response(payload, logger=self.logger)
-                    return payload
-        self.logger.error("Responses API call completed without yielding a response body; returning empty payload.")
-        return {}
 
     # ----------------------------------------------------------------------
     # _run_task_model_request (122 lines)
@@ -4189,7 +3807,7 @@ LOGGER = logging.getLogger(__name__)
 # -----------------------------------------------------------------------------
 
 _COMETAPI_TITLE = "Open WebUI plugin for CometAPI Responses API"
-_COMETAPI_REFERER = "https://github.com/rbb-dev/Open-WebUI-CometAPI-pipe/"
+_COMETAPI_REFERER = "https://github.com/Stylishseahorse/Open-WebUI-CometAPI-pipe/"
 _DEFAULT_PIPE_ID = "open_webui_cometapi_pipe"
 _FUNCTION_MODULE_PREFIX = "function_"
 _COMETAPI_FRONTEND_MODELS_URL = "https://api.cometapi.com/v1/models"
@@ -10046,7 +9664,7 @@ from ..core.timing_logger import timed
 # -----------------------------------------------------------------------------
 
 _COMETAPI_TITLE = "Open WebUI plugin for CometAPI Responses API"
-_COMETAPI_REFERER = "https://github.com/rbb-dev/Open-WebUI-CometAPI-pipe/"
+_COMETAPI_REFERER = "https://github.com/Stylishseahorse/Open-WebUI-CometAPI-pipe/"
 
 # -----------------------------------------------------------------------------
 # Model Helper Functions
@@ -10523,7 +10141,103 @@ class CometAPIModelRegistry:
         provider_id = cls._id_map.get(norm)
 
         if not provider_id:
-            return None
+            base_lower = (model_id_base or "").strip().lower()
+            if not base_lower:
+                return None
+
+            # First, try matching against full catalog entries (including display name aliases).
+            scored: dict[str, int] = {}
+            base_sanitized = sanitize_model_id(model_id_base or "").strip().lower()
+            for entry in cls._models:
+                if not isinstance(entry, dict):
+                    continue
+                original = entry.get("original_id")
+                if not isinstance(original, str) or not original.strip():
+                    continue
+                original_trim = original.strip()
+                original_lower = original_trim.lower()
+                entry_id = (entry.get("id") or "").strip().lower()
+                entry_name = (entry.get("name") or "").strip().lower()
+                entry_name_sanitized = sanitize_model_id(entry_name).strip().lower() if entry_name else ""
+                tail = original_trim.rsplit("/", 1)[-1].strip().lower()
+
+                score = 0
+                if original_lower == base_lower:
+                    score = max(score, 100)
+                if entry_id and entry_id == base_lower:
+                    score = max(score, 90)
+                if tail and tail == base_lower:
+                    score = max(score, 85)
+                if entry_name and entry_name == base_lower:
+                    score = max(score, 80)
+                if entry_name_sanitized and entry_name_sanitized == base_lower:
+                    score = max(score, 75)
+                if base_sanitized and entry_id and entry_id == base_sanitized:
+                    score = max(score, 74)
+                if base_sanitized and tail and tail == base_sanitized:
+                    score = max(score, 73)
+                if base_sanitized and entry_name_sanitized and entry_name_sanitized == base_sanitized:
+                    score = max(score, 72)
+
+                # Fuzzy alias support for user-friendly names (e.g. gpt-5-all, veo3.1).
+                # Apply only as lower-priority signals so exact matches still win.
+                if tail and (base_lower in tail or tail in base_lower):
+                    score = max(score, 60)
+                if entry_id and (base_lower in entry_id or entry_id in base_lower):
+                    score = max(score, 59)
+                if entry_name and (base_lower in entry_name or entry_name in base_lower):
+                    score = max(score, 58)
+                if entry_name_sanitized and base_sanitized and (
+                    base_sanitized in entry_name_sanitized or entry_name_sanitized in base_sanitized
+                ):
+                    score = max(score, 57)
+
+                if score > 0:
+                    scored[original_trim] = max(scored.get(original_trim, 0), score)
+
+            if scored:
+                top_score = max(scored.values())
+                winners = [pid for pid, score in scored.items() if score == top_score]
+                if len(winners) == 1:
+                    provider_id = winners[0]
+
+            candidates: list[str] = []
+            if not provider_id:
+                for pid in cls._id_map.values():
+                    if not isinstance(pid, str):
+                        continue
+                    pid_trim = pid.strip()
+                    if not pid_trim:
+                        continue
+                    pid_lower = pid_trim.lower()
+                    if pid_lower == base_lower:
+                        candidates.append(pid_trim)
+                        continue
+                    # Match by model slug tail (provider/model -> model)
+                    tail = pid_trim.rsplit("/", 1)[-1].strip().lower()
+                    if tail and tail == base_lower:
+                        candidates.append(pid_trim)
+
+                unique_candidates = list(dict.fromkeys(candidates))
+                if len(unique_candidates) == 1:
+                    provider_id = unique_candidates[0]
+                else:
+                    # Final provider heuristic when caller passes a short alias without provider prefix.
+                    short_alias = base_lower
+                    if "/" not in short_alias:
+                        provider_guess: Optional[str] = None
+                        if short_alias.startswith(("gpt", "o1", "o3", "chatgpt", "text-embedding")):
+                            provider_guess = "openai"
+                        elif short_alias.startswith("claude"):
+                            provider_guess = "anthropic"
+                        elif short_alias.startswith(("gemini", "veo", "imagen")):
+                            provider_guess = "google"
+                        elif short_alias.startswith("qwen"):
+                            provider_guess = "qwen"
+                        if provider_guess:
+                            guessed_id = f"{provider_guess}/{model_id_base.strip()}"
+                            return guessed_id
+                    return None
 
         # Re-attach suffix with appropriate separator
         # Presets use @ separator, variants use : separator
@@ -11575,8 +11289,8 @@ class Pipe:
     "'''"
     r'''"""
 title: CometAPI Search
-author: Open-WebUI-CometAPI-pipe
-	author_url: https://github.com/rbb-dev/Open-WebUI-CometAPI-pipe
+author: Stylishseahorse
+	author_url: https://github.com/Stylishseahorse/
 	id: cometapi_search
 	description: Enables CometAPI's web-search plugin for the CometAPI pipe and disables Open WebUI Web Search for this request (CometAPI Search overrides Web Search).
 	version: 0.1.0
@@ -11652,8 +11366,8 @@ class Filter:
     "'''"
     r'''"""
 title: Direct Uploads
-author: Open-WebUI-CometAPI-pipe
-author_url: https://github.com/rbb-dev/Open-WebUI-CometAPI-pipe
+author: Stylishseahorse
+author_url: https://github.com/Stylishseahorse/
 id: __FILTER_ID__
 description: Bypass Open WebUI RAG for chat uploads and forward them to CometAPI as direct file/audio/video inputs (user-controlled via valves).
 version: 0.1.0
@@ -12693,8 +12407,8 @@ class Filter:
     "'''"
     r'''"""
 title: Provider: {safe_display_name_escaped}
-author: Open-WebUI-CometAPI-pipe
-author_url: https://github.com/rbb-dev/Open-WebUI-CometAPI-pipe
+author: Stylishseahorse
+author_url: https://github.com/Stylishseahorse/
 id: {filter_id}
 description: Provider routing for {safe_display_name_escaped}
 version: 0.2.0
@@ -16218,7 +15932,7 @@ class Filter:
                 template=valves.NETWORK_TIMEOUT_TEMPLATE,
                 variables={
                     "timeout_seconds": getattr(e, 'timeout', valves.HTTP_TOTAL_TIMEOUT_SECONDS or 120),
-                    "endpoint": "https://api.cometapi.com/v1/responses",
+                    "endpoint": "https://api.cometapi.com/v1/chat/completions",
                 },
                 log_message=f"Network timeout: {e}",
             )
@@ -16432,12 +16146,14 @@ class Filter:
         event_queue_maxsize: int = 100,
         event_queue_warn_size: int = 1000,
     ) -> AsyncGenerator[dict[str, Any], None]:
-        """Delegate to ResponsesAdapter.send_openai_responses_streaming_request."""
-        async for event in self._ensure_responses_adapter().send_openai_responses_streaming_request(
-            session, request_body, api_key, base_url, valves=valves, workers=workers,
-            breaker_key=breaker_key, delta_char_limit=delta_char_limit, idle_flush_ms=idle_flush_ms,
-            chunk_queue_maxsize=chunk_queue_maxsize, event_queue_maxsize=event_queue_maxsize,
-            event_queue_warn_size=event_queue_warn_size
+        """CometAPI shim: route legacy Responses calls through /chat/completions."""
+        async for event in self._ensure_chat_completions_adapter().send_openai_chat_completions_streaming_request(
+            session,
+            request_body,
+            api_key,
+            base_url,
+            valves=valves,
+            breaker_key=breaker_key,
         ):
             yield event
 
@@ -16886,9 +16602,14 @@ class Filter:
         valves: "Pipe.Valves | None" = None,
         breaker_key: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Delegate to ResponsesAdapter.send_openai_responses_nonstreaming_request."""
-        return await self._ensure_responses_adapter().send_openai_responses_nonstreaming_request(
-            session, request_body, api_key, base_url, valves=valves, breaker_key=breaker_key
+        """CometAPI shim: route legacy Responses calls through /chat/completions."""
+        return await self._ensure_chat_completions_adapter().send_openai_chat_completions_nonstreaming_request(
+            session,
+            request_body,
+            api_key,
+            base_url,
+            valves=valves,
+            breaker_key=breaker_key,
         )
 
     @timed
@@ -18845,6 +18566,11 @@ class RequestOrchestrator:
             responses_body.max_output_tokens = None
 
         normalized_model_id = ModelFamily.base_model(responses_body.model)
+        if isinstance(normalized_model_id, str):
+            normalized_model_id = normalized_model_id.strip()
+            if normalized_model_id.startswith("open_webui_") and "." in normalized_model_id:
+                normalized_model_id = normalized_model_id.split(".", 1)[1].strip()
+            normalized_model_id = ModelFamily.base_model(normalized_model_id) or normalized_model_id
         task_mode = bool(__task__)
         if task_mode:
             if allowlist_norm_ids and normalized_model_id not in allowlist_norm_ids:
@@ -19050,8 +18776,20 @@ class RequestOrchestrator:
                 plugins.append(plugin_payload)
                 responses_body.plugins = plugins
 
-        # Convert the normalized model id back to the original CometAPI id for the API request.
-        setattr(responses_body, "api_model", CometAPIModelRegistry.api_model_id(normalized_model_id) or normalized_model_id)
+        # Resolve API model id for upstream call; prefer catalog-resolved provider id,
+        # then user-requested model string, then normalized fallback.
+        resolved_api_model = CometAPIModelRegistry.api_model_id(normalized_model_id)
+        if not resolved_api_model:
+            requested_model_for_api = (responses_body.model or "").strip()
+            resolved_api_model = requested_model_for_api or normalized_model_id
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug(
+                "Resolved API model id: requested=%s normalized=%s api_model=%s",
+                responses_body.model,
+                normalized_model_id,
+                resolved_api_model,
+            )
+        setattr(responses_body, "api_model", resolved_api_model)
 
         reasoning_retry_attempted = False
         reasoning_effort_retry_attempted = False
