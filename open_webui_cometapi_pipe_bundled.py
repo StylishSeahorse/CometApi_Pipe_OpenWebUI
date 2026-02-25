@@ -16392,6 +16392,25 @@ class Filter:
         normalized = ModelFamily.base_model(trimmed) or trimmed
         return f"{pipe_identifier}.{normalized}"
 
+    @timed
+    def _strip_pipe_prefix_from_model(
+        self,
+        pipe_identifier: Optional[str],
+        model_id: Optional[str],
+    ) -> Optional[str]:
+        """Remove the Open WebUI pipe prefix from a model id when present."""
+        if not isinstance(model_id, str):
+            return None
+        trimmed = model_id.strip()
+        if not trimmed:
+            return None
+        if not pipe_identifier:
+            return trimmed
+        prefix = f"{pipe_identifier}."
+        if trimmed.startswith(prefix):
+            return trimmed[len(prefix):] or None
+        return trimmed
+
     # ======================================================================
     # CometAPI API Adapters
     # ======================================================================
@@ -18763,6 +18782,12 @@ class RequestOrchestrator:
             transformer_valves=valves,
 
         )
+        dequalified_model = self._pipe._strip_pipe_prefix_from_model(
+            pipe_identifier,
+            responses_body.model,
+        )
+        if dequalified_model:
+            responses_body.model = dequalified_model
         self._pipe._sanitize_request_input(responses_body)
         self._pipe._apply_reasoning_preferences(responses_body, valves)
         self._pipe._apply_gemini_thinking_config(responses_body, valves)
